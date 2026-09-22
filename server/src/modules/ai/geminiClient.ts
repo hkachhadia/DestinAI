@@ -35,6 +35,12 @@ interface GeminiApiErrorResponse {
   };
 }
 
+interface GenerateJsonOptions {
+  userId?: string;
+  analysisId?: string;
+  promptType?: string;
+}
+
 function createGeminiError(
   message: string,
   status?: number,
@@ -48,8 +54,7 @@ function createGeminiError(
   error.errorCode = errorCode;
 
   error.retryable =
-    errorKind === 'transient' ||
-    errorKind === 'rate_limit';
+    errorKind === 'transient' || errorKind === 'rate_limit';
 
   return error;
 }
@@ -95,7 +100,10 @@ function getRetryDelayMs(retryNumber: number): number {
   // retry 2 -> ~4 seconds
   //
   // Add jitter so repeated requests do not all retry simultaneously.
-  const baseDelay = Math.min(2000 * Math.pow(2, retryNumber - 1), 8000);
+  const baseDelay = Math.min(
+    2000 * Math.pow(2, retryNumber - 1),
+    8000,
+  );
 
   const jitter = Math.floor(Math.random() * 1000);
 
@@ -125,6 +133,7 @@ async function requestGemini(
   prompt: string,
   userId?: string,
   analysisId?: string,
+  promptType: string = 'career-report',
 ): Promise<string> {
   const apiKey = getApiKey();
 
@@ -144,7 +153,7 @@ async function requestGemini(
     logger.info('[GEMINI] HTTP request started', {
       model,
       promptLength: prompt.length,
-      promptType: 'career-report',
+      promptType,
       userId,
       analysisId,
     });
@@ -254,7 +263,8 @@ async function requestGemini(
         .trim() || '';
 
     if (!text) {
-      const finishReason = data?.candidates?.[0]?.finishReason;
+      const finishReason =
+        data?.candidates?.[0]?.finishReason;
 
       throw createGeminiError(
         finishReason
@@ -322,6 +332,7 @@ async function generateWithModel(
   prompt: string,
   userId?: string,
   analysisId?: string,
+  promptType: string = 'career-report',
 ): Promise<string> {
   let lastError: GeminiRequestError | undefined;
 
@@ -336,6 +347,7 @@ async function generateWithModel(
         prompt,
         userId,
         analysisId,
+        promptType,
       );
     } catch (err) {
       const error =
@@ -357,19 +369,24 @@ async function generateWithModel(
         throw error;
       }
 
-      const delayMs = getRetryDelayMs(retryNumber + 1);
+      const delayMs = getRetryDelayMs(
+        retryNumber + 1,
+      );
 
-      logger.warn('[GEMINI] Retrying after transient failure', {
-        model,
-        retryNumber: retryNumber + 1,
-        maxRetries: MAX_RETRIES_PER_MODEL,
-        delayMs,
-        errorKind: error.errorKind,
-        errorStatus: error.status,
-        errorCode: error.errorCode,
-        userId,
-        analysisId,
-      });
+      logger.warn(
+        '[GEMINI] Retrying after transient failure',
+        {
+          model,
+          retryNumber: retryNumber + 1,
+          maxRetries: MAX_RETRIES_PER_MODEL,
+          delayMs,
+          errorKind: error.errorKind,
+          errorStatus: error.status,
+          errorCode: error.errorCode,
+          userId,
+          analysisId,
+        },
+      );
 
       await sleep(delayMs);
     }
@@ -403,16 +420,21 @@ async function generateWithModel(
  */
 export async function generateJson(
   prompt: string,
-  userId?: string,
-  analysisId?: string,
+  options: GenerateJsonOptions = {},
 ): Promise<string> {
+  const {
+    userId,
+    analysisId,
+    promptType = 'career-report',
+  } = options;
+
   logger.info('[GEMINI] Starting generation', {
     model: MODEL_PREFERENCE[0],
     fallbackModel: MODEL_PREFERENCE[1],
     promptLength: prompt.length,
     userId,
     analysisId,
-    promptType: 'career-report',
+    promptType,
   });
 
   const errors: Array<{
@@ -422,7 +444,11 @@ export async function generateJson(
     message: string;
   }> = [];
 
-  for (let modelIndex = 0; modelIndex < MODEL_PREFERENCE.length; modelIndex += 1) {
+  for (
+    let modelIndex = 0;
+    modelIndex < MODEL_PREFERENCE.length;
+    modelIndex += 1
+  ) {
     const model = MODEL_PREFERENCE[modelIndex];
 
     try {
@@ -431,6 +457,7 @@ export async function generateJson(
         prompt,
         userId,
         analysisId,
+        promptType,
       );
 
       logger.info('[GEMINI] Generation successful', {
@@ -439,6 +466,7 @@ export async function generateJson(
         responseLength: result.length,
         userId,
         analysisId,
+        promptType,
       });
 
       return result;
@@ -475,31 +503,42 @@ export async function generateJson(
         );
       }
 
-      logger.warn('[GEMINI] Switching to fallback model', {
-        failedModel: model,
-        fallbackModel: nextModel,
-        errorKind: error.errorKind,
-        errorStatus: error.status,
-        errorCode: error.errorCode,
-        userId,
-        analysisId,
-      });
+      logger.warn(
+        '[GEMINI] Switching to fallback model',
+        {
+          failedModel: model,
+          fallbackModel: nextModel,
+          errorKind: error.errorKind,
+          errorStatus: error.status,
+          errorCode: error.errorCode,
+          userId,
+          analysisId,
+          promptType,
+        },
+      );
     }
   }
 
-  const lastError = errors[errors.length - 1];
+  const lastError =
+    errors[errors.length - 1];
 
-  logger.error('[GEMINI] All configured models failed', {
-    attemptedModels: errors.map((item) => item.model),
-    errors: errors.map((item) => ({
-      model: item.model,
-      errorKind: item.errorKind,
-      status: item.status,
-      message: item.message,
-    })),
-    userId,
-    analysisId,
-  });
+  logger.error(
+    '[GEMINI] All configured models failed',
+    {
+      attemptedModels: errors.map(
+        (item) => item.model,
+      ),
+      errors: errors.map((item) => ({
+        model: item.model,
+        errorKind: item.errorKind,
+        status: item.status,
+        message: item.message,
+      })),
+      userId,
+      analysisId,
+      promptType,
+    },
+  );
 
   if (lastError?.errorKind === 'rate_limit') {
     throw new ApiError(
@@ -519,7 +558,8 @@ export async function generateJson(
 
   throw new ApiError(
     lastError?.status || 502,
-    lastError?.message || 'Failed to generate response from Gemini',
+    lastError?.message ||
+      'Failed to generate response from Gemini',
     ErrorCodes.AI_GENERATION_FAILED,
   );
 }
