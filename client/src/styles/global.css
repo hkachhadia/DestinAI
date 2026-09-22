@@ -1,0 +1,93 @@
+/**
+ * DestinAI — supplementary styles
+ * Core design tokens are in index.css (:root + .dark)
+ * This file only adds component-specific utility classes that
+ * don't belong in index.css.
+ */
+
+/* ── Data table ──────────────────────────────────────────────── */
+.data-table            { width: 100%; border-collapse: collapse; }
+.data-table th         { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+.data-table td         { padding: 12px 14px; font-size: 14px; color: var(--text-primary); border-bottom: 1px solid var(--border); vertical-align: middle; }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr:hover td { background: var(--bg-subtle); }
+
+/* ── Divider ─────────────────────────────────────────────────── */
+.divider { height: 1px; background: var(--border); }
+
+/* ── Progress bars ───────────────────────────────────────────── */
+.progress-bar-track    { height: 5px; background: var(--bg-overlay); border-radius: 100px; overflow: hidden; }
+.progress-bar-fill     { height: 100%; border-radius: 100px; transition: width 0.8s cubic-bezier(0.4,0,0.2,1); }
+
+/* ── Input-pro (legacy alias) ────────────────────────────────── */
+.input-pro             { width: 100%; background: var(--bg-subtle); border: 1px solid var(--border); border-radius: 10px; padding: 11px 14px; font-size: 14px; color: var(--text-primary); font-family: inherit; transition: border-color 0.15s ease, box-shadow 0.15s ease; outline: none; }
+.input-pro::placeholder{ color: var(--text-muted); }
+.input-pro:focus       { border-color: var(--accent); box-shadow: var(--ring-focus); }
+.input-pro:disabled    { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Recharts custom tooltips ────────────────────────────────── */
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 10px !important;
+  font-family: 'Inter', sans-serif !important;
+  font-size: 13px !important;
+  box-shadow: var(--shadow-dropdown) !important;
+}
+
+/* ── Sidebar section label ───────────────────────────────────── */
+.sidebar-section-label {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
+  color: var(--text-muted); padding: 8px 14px 4px; text-transform: uppercase;
+}
+
+/* ── Score ring track/fill ───────────────────────────────────── */
+.score-ring-track { fill: none; stroke: var(--bg-overlay); }
+.score-ring-fill  { fill: none; stroke-linecap: round; transition: stroke-dasharray 0.8s cubic-bezier(0.4,0,0.2,1); }
+
+/* ── Legacy Stitch token aliases ─────────────────────────────── */
+/* These keep existing pages functional without modification */
+--border-subtle:        var(--border);
+--border-medium:        var(--border-strong);
+.border-outline-variant { border-color: var(--border); }
+.bg-surface-container       { background: var(--bg-subtle); }
+.bg-surface-container-high  { background: var(--bg-overlay); }
+.bg-surface-container-highest { background: var(--bg-overlay); }
+.bg-surface-container-lowest  { background: var(--bg-card); }
+.text-primary-fixed     { color: var(--accent); }
+.bg-primary-fixed       { background: var(--accent); }
+.text-on-primary-fixed  { color: #fff; }
+.text-on-primary        { color: #fff; }
+.primary-gradient       { background: linear-gradient(135deg, var(--accent), var(--accent-hover)); }
+.secondary-gradient     { background: var(--accent-subtle); color: var(--accent); }
+.text-secondary-container{ color: var(--cyan); }
+.bg-secondary-container  { background: var(--cyan); }
+.text-on-secondary-container { color: #fff; }
+.text-error             { color: var(--error); }
+.bg-error               { background: var(--error); }
+.border-error           { border-color: var(--error); }
+.font-syne              { font-family: 'Inter', sans-serif; font-weight: 700; }
+.font-headline-lg       { font-size: 1.75rem; font-weight: 700; line-height: 1.2; }
+.font-headline-md       { font-size: 1.4rem; font-weight: 700; line-height: 1.2; }
+.text-headline-lg       { font-size: 1.75rem; }
+.text-headline-md       { font-size: 1.4rem; }
+.text-headline-lg-mobile{ font-size: 1.5rem; }
+.text-headline-xl       { font-size: 2.5rem; font-weight: 800; }
+.font-headline-xl       { font-size: 2.5rem; font-weight: 800; line-height: 1.15; }
+.text-body-md           { font-size: 0.9375rem; line-height: 1.6; }
+.font-body-md           { font-size: 0.9375rem; line-height: 1.6; }
+.text-body-lg           { font-size: 1.0625rem; line-height: 1.65; }
+.font-body-lg           { font-size: 1.0625rem; line-height: 1.65; }
+.text-label-sm          { font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; }
+.font-label-md          { font-size: 0.8125rem; font-weight: 500; }
+.font-label-sm          { font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; }
+.gradient-text          { background: linear-gradient(135deg, var(--accent), var(--cyan)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+.text-gradient          { background: linear-gradient(135deg, var(--accent), var(--cyan)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+.glow-effect            { box-shadow: 0 0 20px rgba(37,99,235,0.25); }
+.primary-glow           { box-shadow: 0 0 20px rgba(37,99,235,0.2); }
+.custom-scrollbar::-webkit-scrollbar { width: 4px; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 10px; }
+.ambient-glow-circle    { position: absolute; width: 500px; height: 500px; border-radius: 50%; background: radial-gradient(circle, rgba(37,99,235,0.06) 0%, transparent 70%); filter: blur(80px); z-index: 0; pointer-events: none; }
+.glow-primary           { box-shadow: 0 0 20px rgba(37,99,235,0.2); }
+.px-margin-mobile       { padding-left: 1rem; padding-right: 1rem; }
+.px-margin-desktop      { padding-left: 2rem; padding-right: 2rem; }
