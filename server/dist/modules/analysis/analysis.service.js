@@ -12,7 +12,6 @@ const resume_service_1 = require("../resume/resume.service");
 const github_service_1 = require("../github/github.service");
 const cp_service_1 = require("../competitiveProgramming/cp.service");
 const scoring_service_1 = require("../scoring/scoring.service");
-const ai_service_1 = require("../ai/ai.service");
 const ApiError_1 = require("../../utils/ApiError");
 const user_model_1 = require("../user/user.model");
 const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
@@ -21,51 +20,83 @@ function isStale(lastSyncedAt, force = false) {
         return true;
     if (!lastSyncedAt)
         return true;
-    return Date.now() - new Date(lastSyncedAt).getTime() > STALE_THRESHOLD_MS;
+    return (Date.now() - new Date(lastSyncedAt).getTime() >
+        STALE_THRESHOLD_MS);
 }
-/** CHANGE 1: If new handles are provided in options, connect/update them first.
- * Then auto-sync any stale existing profiles. This ensures re-analysis always
- * uses the freshest possible data — including new usernames entered in the modal. */
+/**
+ * If new handles are provided in options, connect/update them first.
+ * Then auto-sync any stale existing profiles.
+ *
+ * This ensures re-analysis always uses the freshest possible data,
+ * including new usernames entered in the modal.
+ */
 async function prepareProfiles(userId, options) {
     const jobs = [];
-    // ── Step 1: Connect or update provided handles ────────────────────────────
+    // ── Step 1: Connect or update provided handles ──────────────────────────
     if (options.githubUsername) {
         jobs.push((0, github_service_1.connectGitHub)(userId, options.githubUsername).catch((err) => logger_1.logger.warn(`[REANALYSIS] GitHub connect failed: ${err.message}`)));
     }
     const cpUpdates = [];
-    if (options.leetcodeUsername)
-        cpUpdates.push({ platform: 'leetcode', handle: options.leetcodeUsername });
-    if (options.codeforcesHandle)
-        cpUpdates.push({ platform: 'codeforces', handle: options.codeforcesHandle });
-    if (options.codechefUsername)
-        cpUpdates.push({ platform: 'codechef', handle: options.codechefUsername });
-    if (options.gfgUsername)
-        cpUpdates.push({ platform: 'gfg', handle: options.gfgUsername });
-    if (options.hackerrankUsername)
-        cpUpdates.push({ platform: 'hackerrank', handle: options.hackerrankUsername });
+    if (options.leetcodeUsername) {
+        cpUpdates.push({
+            platform: 'leetcode',
+            handle: options.leetcodeUsername,
+        });
+    }
+    if (options.codeforcesHandle) {
+        cpUpdates.push({
+            platform: 'codeforces',
+            handle: options.codeforcesHandle,
+        });
+    }
+    if (options.codechefUsername) {
+        cpUpdates.push({
+            platform: 'codechef',
+            handle: options.codechefUsername,
+        });
+    }
+    if (options.gfgUsername) {
+        cpUpdates.push({
+            platform: 'gfg',
+            handle: options.gfgUsername,
+        });
+    }
+    if (options.hackerrankUsername) {
+        cpUpdates.push({
+            platform: 'hackerrank',
+            handle: options.hackerrankUsername,
+        });
+    }
     for (const cp of cpUpdates) {
         jobs.push((0, cp_service_1.connectPlatform)(userId, cp.platform, cp.handle).catch((err) => logger_1.logger.warn(`[REANALYSIS] ${cp.platform} connect failed: ${err.message}`)));
     }
     // Save supplemental profile fields
     const supplemental = {};
-    if (options.linkedinUrl)
+    if (options.linkedinUrl) {
         supplemental.linkedinUrl = options.linkedinUrl;
-    if (options.portfolioUrl)
+    }
+    if (options.portfolioUrl) {
         supplemental.portfolioUrl = options.portfolioUrl;
-    if (options.kaggleUsername)
+    }
+    if (options.kaggleUsername) {
         supplemental.kaggleUsername = options.kaggleUsername;
-    if (options.mediumUsername)
+    }
+    if (options.mediumUsername) {
         supplemental.mediumUsername = options.mediumUsername;
-    if (options.devtoUsername)
+    }
+    if (options.devtoUsername) {
         supplemental.devtoUsername = options.devtoUsername;
+    }
     if (Object.keys(supplemental).length > 0) {
-        jobs.push(user_model_1.User.findByIdAndUpdate(userId, { $set: supplemental }).catch((err) => logger_1.logger.warn(`[REANALYSIS] Supplemental profile update failed: ${err.message}`)));
+        jobs.push(user_model_1.User.findByIdAndUpdate(userId, {
+            $set: supplemental,
+        }).catch((err) => logger_1.logger.warn(`[REANALYSIS] Supplemental profile update failed: ${err.message}`)));
     }
     // Execute all connection jobs in parallel
     if (jobs.length > 0) {
         await Promise.allSettled(jobs);
     }
-    // ── Step 2: Auto-sync stale existing profiles ─────────────────────────────
+    // ── Step 2: Auto-sync stale existing profiles ───────────────────────────
     const [github, cpProfiles] = await Promise.all([
         (0, github_service_1.getGitHubProfile)(userId),
         (0, cp_service_1.getAllProfiles)(userId),
@@ -101,9 +132,12 @@ async function runAnalysis(userId, options = {}) {
     const targetRole = options.targetRole ??
         user?.targetRole ??
         'Software Engineer';
-    // Step 3: Compute scores
+    // Step 3: Compute deterministic scores
     const { breakdown, weightsUsed, skillMatch } = (0, scoring_service_1.computeScores)({
-        resume, github, competitiveProfiles, targetRole,
+        resume,
+        github,
+        competitiveProfiles,
+        targetRole,
     });
     // Step 4: Persist analysis — always creates a NEW document
     const analysis = await analysis_model_1.Analysis.create({
@@ -117,80 +151,63 @@ async function runAnalysis(userId, options = {}) {
         scores: breakdown,
         weightsUsed,
         skillMatch,
+        // AI will be generated separately after the analysis response.
         aiInsightId: null,
     });
-    // Step 5: Generate AI narrative
-    // Analysis is valid even if AI fails (scores are deterministic).
-    // Errors are logged with full context but do NOT block the analysis response.
-    if (!options.skipAIReport) {
-        try {
-            logger_1.logger.info('[ANALYSIS] Starting AI report generation', {
-                userId,
-                analysisId: String(analysis._id),
-                targetRole,
-                resumeConnected: !!resume,
-                githubConnected: !!github,
-                cpCount: competitiveProfiles.length,
-                careerScore: breakdown.careerScore,
-            });
-            const insight = await (0, ai_service_1.generateCareerReport)(userId, String(analysis._id), {
-                targetRole,
-                resume,
-                github,
-                competitiveProfiles,
-                scores: breakdown,
-                missingSkillsFromEngine: skillMatch.missingSkills,
-            });
-            // Update analysis to reference the new insight document
-            analysis.aiInsightId = insight._id;
-            await analysis.save();
-            logger_1.logger.info('[ANALYSIS] AI report saved successfully', {
-                userId,
-                analysisId: String(analysis._id),
-                insightId: String(insight._id),
-            });
-        }
-        catch (err) {
-            // Log the real error so operators know WHY AI failed
-            const errMsg = err?.message ?? String(err);
-            const errCode = err?.code;
-            const httpStatus = err?.statusCode;
-            logger_1.logger.error('[ANALYSIS] AI report generation failed — scores are still valid', {
-                userId,
-                analysisId: String(analysis._id),
-                targetRole,
-                errorType: err?.constructor?.name,
-                errorMessage: errMsg,
-                errorCode: errCode,
-                httpStatus,
-                // Hint for the most common cause
-                hint: httpStatus === 403 || httpStatus === 401
-                    ? 'GEMINI_API_KEY may be invalid — check server/.env and get a key from https://aistudio.google.com/app/apikey'
-                    : httpStatus === 429
-                        ? 'Gemini rate limit hit — user can retry in a minute'
-                        : 'Check Gemini connectivity with validateGeminiConnectivity()',
-            });
-        }
-    }
+    /**
+     * IMPORTANT:
+     *
+     * Gemini AI generation intentionally does NOT happen here anymore.
+     *
+     * runAnalysis() now finishes as soon as the deterministic analysis
+     * has been calculated and persisted.
+     *
+     * The AI report will be generated separately using the analysis ID.
+     *
+     * This prevents the POST /analysis request from waiting for Gemini.
+     */
+    logger_1.logger.info('[ANALYSIS] Deterministic analysis completed', {
+        userId,
+        analysisId: String(analysis._id),
+        targetRole,
+        resumeConnected: !!resume,
+        githubConnected: !!github,
+        cpCount: competitiveProfiles.length,
+        careerScore: breakdown.careerScore,
+    });
     return analysis;
 }
 async function getAnalysisById(userId, analysisId) {
-    const analysis = await analysis_model_1.Analysis.findOne({ _id: analysisId, userId: new mongoose_1.Types.ObjectId(userId) });
-    if (!analysis)
+    const analysis = await analysis_model_1.Analysis.findOne({
+        _id: analysisId,
+        userId: new mongoose_1.Types.ObjectId(userId),
+    });
+    if (!analysis) {
         throw new ApiError_1.ApiError(404, 'Analysis not found', ApiError_1.ErrorCodes.ANALYSIS_NOT_FOUND);
+    }
     return analysis;
 }
 async function getLatestAnalysis(userId) {
-    return analysis_model_1.Analysis.findOne({ userId: new mongoose_1.Types.ObjectId(userId) }).sort({ createdAt: -1 });
+    return analysis_model_1.Analysis.findOne({
+        userId: new mongoose_1.Types.ObjectId(userId),
+    }).sort({ createdAt: -1 });
 }
 async function deleteAnalysis(userId, analysisId) {
-    const analysis = await analysis_model_1.Analysis.findOne({ _id: analysisId, userId: new mongoose_1.Types.ObjectId(userId) });
-    if (!analysis)
+    const analysis = await analysis_model_1.Analysis.findOne({
+        _id: analysisId,
+        userId: new mongoose_1.Types.ObjectId(userId),
+    });
+    if (!analysis) {
         throw new ApiError_1.ApiError(404, 'Analysis not found', ApiError_1.ErrorCodes.ANALYSIS_NOT_FOUND);
+    }
     await analysis.deleteOne();
 }
 async function deleteAllAnalyses(userId) {
-    const result = await analysis_model_1.Analysis.deleteMany({ userId: new mongoose_1.Types.ObjectId(userId) });
-    return { deletedCount: result.deletedCount };
+    const result = await analysis_model_1.Analysis.deleteMany({
+        userId: new mongoose_1.Types.ObjectId(userId),
+    });
+    return {
+        deletedCount: result.deletedCount,
+    };
 }
 //# sourceMappingURL=analysis.service.js.map

@@ -2,13 +2,25 @@ import { env } from '@config/env';
 import { ApiError, ErrorCodes } from '@utils/ApiError';
 import { logger } from '@config/logger';
 
-const MODEL_PREFERENCE = [
+const FALLBACK_MODELS = [
   'gemini-3.8-flash',
   'gemini-3.7-flash',
   'gemini-3.6-flash',
 ] as const;
 
-const REQUEST_TIMEOUT_MS = 60_000;
+/*
+ * Gemini should normally respond well below this time.
+ * A shorter timeout prevents long-running requests from occupying
+ * server resources unnecessarily.
+ */
+const REQUEST_TIMEOUT_MS = 45_000;
+
+/*
+ * Retries are ONLY used for genuinely transient failures such as
+ * 503/504/timeouts.
+ *
+ * Rate-limit/quota errors (429) are never retried.
+ */
 const MAX_RETRIES_PER_MODEL = 2;
 
 type GeminiErrorKind =
@@ -41,6 +53,23 @@ interface GenerateJsonOptions {
   promptType?: string;
 }
 
+/**
+ * Build the model preference list.
+ *
+ * GEMINI_MODEL is always attempted first when configured.
+ * Fallback models are used only when switching models may reasonably help.
+ */
+function getModelPreference(): string[] {
+  const configuredModel = env.GEMINI_MODEL?.trim();
+
+  const models = [
+    configuredModel,
+    ...FALLBACK_MODELS,
+  ].filter(Boolean) as string[];
+
+  return [...new Set(models)];
+}
+
 function createGeminiError(
   message: string,
   status?: number,
@@ -53,8 +82,14 @@ function createGeminiError(
   error.errorKind = errorKind;
   error.errorCode = errorCode;
 
-  error.retryable =
-    errorKind === 'transient' || errorKind === 'rate_limit';
+  /*
+   * IMPORTANT:
+   * 429 errors are deliberately NOT retryable.
+   *
+   * Retrying a free-tier quota error wastes requests and does not
+   * increase the available project quota.
+   */
+  error.retryable = errorKind === 'transient';
 
   return error;
 }
@@ -95,11 +130,6 @@ function classifyGeminiError(
 }
 
 function getRetryDelayMs(retryNumber: number): number {
-  // Exponential backoff:
-  // retry 1 -> ~2 seconds
-  // retry 2 -> ~4 seconds
-  //
-  // Add jitter so repeated requests do not all retry simultaneously.
   const baseDelay = Math.min(
     2000 * Math.pow(2, retryNumber - 1),
     8000,
@@ -175,30 +205,36 @@ async function requestGemini(
             ],
           },
         ],
+
+        /*
+         * Keep the response strictly JSON.
+         *
+         * 6144 is sufficient for the structured career report while
+         * preventing unnecessarily large model responses.
+         */
         generationConfig: {
           responseMimeType: 'application/json',
           temperature: 0.4,
-          maxOutputTokens: 8192,
+          maxOutputTokens: 6144,
         },
       }),
       signal: controller.signal,
     });
 
     const latencyMs = Date.now() - startedAt;
-
     const rawBody = await response.text();
 
     if (!response.ok) {
       let parsedBody: GeminiApiErrorResponse = {};
 
       try {
-        parsedBody = JSON.parse(rawBody) as GeminiApiErrorResponse;
+        parsedBody =
+          JSON.parse(rawBody) as GeminiApiErrorResponse;
       } catch {
         // Keep parsedBody empty if Google did not return JSON.
       }
 
       const googleError = parsedBody.error;
-
       const status = response.status;
 
       const errorCode =
@@ -212,7 +248,10 @@ async function requestGemini(
         rawBody ||
         `Gemini request failed with HTTP ${status}`;
 
-      const errorKind = classifyGeminiError(status, errorCode);
+      const errorKind = classifyGeminiError(
+        status,
+        errorCode,
+      );
 
       const error = createGeminiError(
         errorMessage,
@@ -258,7 +297,10 @@ async function requestGemini(
 
     const text =
       data?.candidates?.[0]?.content?.parts
-        ?.map((part: { text?: string }) => part?.text || '')
+        ?.map(
+          (part: { text?: string }) =>
+            part?.text || '',
+        )
         .join('')
         .trim() || '';
 
@@ -300,12 +342,17 @@ async function requestGemini(
       throw timeoutError;
     }
 
-    if (err instanceof Error && 'errorKind' in err) {
+    if (
+      err instanceof Error &&
+      'errorKind' in err
+    ) {
       throw err;
     }
 
     const originalMessage =
-      err instanceof Error ? err.message : String(err);
+      err instanceof Error
+        ? err.message
+        : String(err);
 
     const requestError = createGeminiError(
       originalMessage,
@@ -357,10 +404,29 @@ async function generateWithModel(
 
       lastError = error;
 
+      /*
+       * 429 means project quota/rate limit.
+       * Do not retry and do not consume additional requests.
+       */
+      if (error.errorKind === 'rate_limit') {
+        logger.warn(
+          '[GEMINI] Rate limit reached — stopping retries',
+          {
+            model,
+            errorStatus: error.status,
+            errorCode: error.errorCode,
+            userId,
+            analysisId,
+            promptType,
+          },
+        );
+
+        throw error;
+      }
+
       const isRetryable =
-        error.retryable === true ||
-        error.errorKind === 'transient' ||
-        error.errorKind === 'rate_limit';
+        error.errorKind === 'transient' &&
+        error.retryable === true;
 
       const hasRetriesLeft =
         retryNumber < MAX_RETRIES_PER_MODEL;
@@ -401,22 +467,18 @@ async function generateWithModel(
 /**
  * Generates JSON-only content from Gemini.
  *
- * Strategy:
+ * Model strategy:
+ * 1. Configured GEMINI_MODEL
+ * 2. Fallback models only when switching may help
  *
- * Model 1
- *   -> retry with exponential backoff + jitter
- *   -> retry again
+ * 429:
+ * - stop immediately
+ * - do not retry
+ * - do not switch models
  *
- * Model 2
- *   -> retry with exponential backoff + jitter
- *   -> retry again
- *
- * Model 3
- *   -> retry with exponential backoff + jitter
- *   -> retry again
- *
- * This is especially important for temporary 503 UNAVAILABLE
- * responses caused by Gemini service capacity/high demand.
+ * Transient errors:
+ * - retry the same model
+ * - then try the next model
  */
 export async function generateJson(
   prompt: string,
@@ -428,9 +490,12 @@ export async function generateJson(
     promptType = 'career-report',
   } = options;
 
+  const modelPreference = getModelPreference();
+
   logger.info('[GEMINI] Starting generation', {
-    model: MODEL_PREFERENCE[0],
-    fallbackModel: MODEL_PREFERENCE[1],
+    model: modelPreference[0],
+    fallbackModel: modelPreference[1],
+    configuredModels: modelPreference,
     promptLength: prompt.length,
     userId,
     analysisId,
@@ -446,10 +511,10 @@ export async function generateJson(
 
   for (
     let modelIndex = 0;
-    modelIndex < MODEL_PREFERENCE.length;
+    modelIndex < modelPreference.length;
     modelIndex += 1
   ) {
-    const model = MODEL_PREFERENCE[modelIndex];
+    const model = modelPreference[modelIndex];
 
     try {
       const result = await generateWithModel(
@@ -483,15 +548,36 @@ export async function generateJson(
         message: error.message,
       });
 
-      const nextModel =
-        MODEL_PREFERENCE[modelIndex + 1];
+      /*
+       * CRITICAL:
+       *
+       * A 429 is a project-level quota/rate-limit problem.
+       * Trying another model will not solve the quota issue.
+       */
+      if (error.errorKind === 'rate_limit') {
+        logger.warn(
+          '[GEMINI] Project quota/rate limit reached — no fallback model attempted',
+          {
+            failedModel: model,
+            errorStatus: error.status,
+            errorCode: error.errorCode,
+            userId,
+            analysisId,
+            promptType,
+          },
+        );
 
-      if (!nextModel) {
-        break;
+        throw new ApiError(
+          429,
+          'Gemini API free-tier quota or rate limit has been reached. No additional Gemini requests were attempted. Please try again after the quota window resets.',
+          ErrorCodes.AI_GENERATION_FAILED,
+        );
       }
 
-      // Authentication and invalid-request errors will not be fixed
-      // by changing models, so fail immediately.
+      /*
+       * Authentication and invalid-request errors will not be fixed
+       * by changing models.
+       */
       if (
         error.errorKind === 'auth' ||
         error.errorKind === 'invalid_request'
@@ -501,6 +587,13 @@ export async function generateJson(
           `Gemini API request failed: ${error.message}`,
           ErrorCodes.AI_GENERATION_FAILED,
         );
+      }
+
+      const nextModel =
+        modelPreference[modelIndex + 1];
+
+      if (!nextModel) {
+        break;
       }
 
       logger.warn(
@@ -540,14 +633,6 @@ export async function generateJson(
     },
   );
 
-  if (lastError?.errorKind === 'rate_limit') {
-    throw new ApiError(
-      429,
-      'Gemini API rate limit reached. Please try again shortly.',
-      ErrorCodes.AI_GENERATION_FAILED,
-    );
-  }
-
   if (lastError?.errorKind === 'transient') {
     throw new ApiError(
       503,
@@ -567,8 +652,8 @@ export async function generateJson(
 /**
  * Lightweight connectivity check.
  *
- * This does not expose the API key and can be used by a diagnostic
- * route to verify that the Gemini API is reachable.
+ * This only verifies whether the API key is configured.
+ * It does not make a Gemini generation request.
  */
 export async function validateGeminiConnectivity(): Promise<{
   configured: boolean;

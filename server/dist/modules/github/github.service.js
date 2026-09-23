@@ -13,6 +13,7 @@ const githubClient = (0, httpClient_1.createRetryingClient)({
     baseURL: 'https://api.github.com',
     headers: {
         Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
         ...(env_1.env.GITHUB_API_TOKEN
             ? {
                 Authorization: `Bearer ${env_1.env.GITHUB_API_TOKEN}`,
@@ -20,6 +21,21 @@ const githubClient = (0, httpClient_1.createRetryingClient)({
             : {}),
     },
 });
+// Public REST fallback. GitHub's public user/repository endpoints can be
+// accessed without authentication. This is intentionally kept separate from
+// the authenticated client so an invalid/revoked server token does not make
+// all public GitHub scoring fail.
+const githubPublicClient = (0, httpClient_1.createRetryingClient)({
+    baseURL: 'https://api.github.com',
+    headers: {
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+    },
+});
+function isGitHubUnauthorized(err) {
+    const error = err;
+    return error.response?.status === 401;
+}
 /**
  * Fetch a GitHub user profile.
  */
@@ -29,26 +45,54 @@ async function fetchGitHubUser(username) {
         return data;
     }
     catch (err) {
+        // A bad/revoked GITHUB_API_TOKEN should not prevent public GitHub
+        // profiles from being analyzed. Retry the public endpoint once without
+        // authentication. Other errors are still surfaced normally.
+        if (isGitHubUnauthorized(err)) {
+            logger_1.logger.warn('[GITHUB] Authenticated request returned 401; retrying public user endpoint', {
+                username,
+            });
+            try {
+                const { data } = await githubPublicClient.get(`/users/${encodeURIComponent(username)}`);
+                return data;
+            }
+            catch (publicErr) {
+                handleGithubError(publicErr);
+            }
+        }
         handleGithubError(err);
-        throw err;
     }
 }
 /**
  * Fetch public repositories for a GitHub user.
  */
 async function fetchGitHubRepos(username) {
+    const requestConfig = {
+        params: {
+            per_page: 100,
+            sort: 'updated',
+        },
+    };
     try {
-        const { data } = await githubClient.get(`/users/${encodeURIComponent(username)}/repos`, {
-            params: {
-                per_page: 100,
-                sort: 'updated',
-            },
-        });
+        const { data } = await githubClient.get(`/users/${encodeURIComponent(username)}/repos`, requestConfig);
         return data;
     }
     catch (err) {
+        // See fetchGitHubUser(): a stale server token must not turn public
+        // repository data into a zero GitHub score.
+        if (isGitHubUnauthorized(err)) {
+            logger_1.logger.warn('[GITHUB] Authenticated repository request returned 401; retrying public repository endpoint', {
+                username,
+            });
+            try {
+                const { data } = await githubPublicClient.get(`/users/${encodeURIComponent(username)}/repos`, requestConfig);
+                return data;
+            }
+            catch (publicErr) {
+                handleGithubError(publicErr);
+            }
+        }
         handleGithubError(err);
-        throw err;
     }
 }
 /**
@@ -84,14 +128,21 @@ async function fetchCommitsLastYear(username) {
             },
         });
         if (data.errors?.length) {
-            logger_1.logger.warn('[GITHUB] GraphQL returned errors', {
+            logger_1.logger.warn('[GITHUB] GraphQL returned errors; commits will be recorded as 0', {
                 username,
                 errors: data.errors,
             });
             return 0;
         }
-        return (data.data?.user?.contributionsCollection?.contributionCalendar
-            ?.totalContributions ?? 0);
+        const totalContributions = data.data?.user?.contributionsCollection?.contributionCalendar
+            ?.totalContributions;
+        if (typeof totalContributions !== 'number') {
+            logger_1.logger.warn('[GITHUB] GraphQL returned no contribution count; commits will be recorded as 0', {
+                username,
+            });
+            return 0;
+        }
+        return totalContributions;
     }
     catch (err) {
         const error = err;
@@ -266,6 +317,7 @@ async function syncGitHubProfile(userId) {
     logger_1.logger.info('[GITHUB] Starting profile sync', {
         userId,
         username,
+        authenticatedClientConfigured: Boolean(env_1.env.GITHUB_API_TOKEN),
     });
     /*
      * Fetch user profile and repositories in parallel.

@@ -5,20 +5,51 @@ exports.validateGeminiConnectivity = validateGeminiConnectivity;
 const env_1 = require("../../config/env");
 const ApiError_1 = require("../../utils/ApiError");
 const logger_1 = require("../../config/logger");
-const MODEL_PREFERENCE = [
+const FALLBACK_MODELS = [
     'gemini-3.8-flash',
     'gemini-3.7-flash',
     'gemini-3.6-flash',
 ];
-const REQUEST_TIMEOUT_MS = 60_000;
+/*
+ * Gemini should normally respond well below this time.
+ * A shorter timeout prevents long-running requests from occupying
+ * server resources unnecessarily.
+ */
+const REQUEST_TIMEOUT_MS = 45_000;
+/*
+ * Retries are ONLY used for genuinely transient failures such as
+ * 503/504/timeouts.
+ *
+ * Rate-limit/quota errors (429) are never retried.
+ */
 const MAX_RETRIES_PER_MODEL = 2;
+/**
+ * Build the model preference list.
+ *
+ * GEMINI_MODEL is always attempted first when configured.
+ * Fallback models are used only when switching models may reasonably help.
+ */
+function getModelPreference() {
+    const configuredModel = env_1.env.GEMINI_MODEL?.trim();
+    const models = [
+        configuredModel,
+        ...FALLBACK_MODELS,
+    ].filter(Boolean);
+    return [...new Set(models)];
+}
 function createGeminiError(message, status, errorKind = 'unknown', errorCode) {
     const error = new Error(message);
     error.status = status;
     error.errorKind = errorKind;
     error.errorCode = errorCode;
-    error.retryable =
-        errorKind === 'transient' || errorKind === 'rate_limit';
+    /*
+     * IMPORTANT:
+     * 429 errors are deliberately NOT retryable.
+     *
+     * Retrying a free-tier quota error wastes requests and does not
+     * increase the available project quota.
+     */
+    error.retryable = errorKind === 'transient';
     return error;
 }
 function classifyGeminiError(status, errorCode) {
@@ -46,11 +77,6 @@ function classifyGeminiError(status, errorCode) {
     return 'unknown';
 }
 function getRetryDelayMs(retryNumber) {
-    // Exponential backoff:
-    // retry 1 -> ~2 seconds
-    // retry 2 -> ~4 seconds
-    //
-    // Add jitter so repeated requests do not all retry simultaneously.
     const baseDelay = Math.min(2000 * Math.pow(2, retryNumber - 1), 8000);
     const jitter = Math.floor(Math.random() * 1000);
     return baseDelay + jitter;
@@ -99,10 +125,16 @@ async function requestGemini(model, prompt, userId, analysisId, promptType = 'ca
                         ],
                     },
                 ],
+                /*
+                 * Keep the response strictly JSON.
+                 *
+                 * 6144 is sufficient for the structured career report while
+                 * preventing unnecessarily large model responses.
+                 */
                 generationConfig: {
                     responseMimeType: 'application/json',
                     temperature: 0.4,
-                    maxOutputTokens: 8192,
+                    maxOutputTokens: 6144,
                 },
             }),
             signal: controller.signal,
@@ -112,7 +144,8 @@ async function requestGemini(model, prompt, userId, analysisId, promptType = 'ca
         if (!response.ok) {
             let parsedBody = {};
             try {
-                parsedBody = JSON.parse(rawBody);
+                parsedBody =
+                    JSON.parse(rawBody);
             }
             catch {
                 // Keep parsedBody empty if Google did not return JSON.
@@ -181,10 +214,13 @@ async function requestGemini(model, prompt, userId, analysisId, promptType = 'ca
             });
             throw timeoutError;
         }
-        if (err instanceof Error && 'errorKind' in err) {
+        if (err instanceof Error &&
+            'errorKind' in err) {
             throw err;
         }
-        const originalMessage = err instanceof Error ? err.message : String(err);
+        const originalMessage = err instanceof Error
+            ? err.message
+            : String(err);
         const requestError = createGeminiError(originalMessage, undefined, 'unknown');
         logger_1.logger.error('[GEMINI] Request exception', {
             model,
@@ -210,9 +246,23 @@ async function generateWithModel(model, prompt, userId, analysisId, promptType =
                 ? err
                 : createGeminiError(String(err));
             lastError = error;
-            const isRetryable = error.retryable === true ||
-                error.errorKind === 'transient' ||
-                error.errorKind === 'rate_limit';
+            /*
+             * 429 means project quota/rate limit.
+             * Do not retry and do not consume additional requests.
+             */
+            if (error.errorKind === 'rate_limit') {
+                logger_1.logger.warn('[GEMINI] Rate limit reached — stopping retries', {
+                    model,
+                    errorStatus: error.status,
+                    errorCode: error.errorCode,
+                    userId,
+                    analysisId,
+                    promptType,
+                });
+                throw error;
+            }
+            const isRetryable = error.errorKind === 'transient' &&
+                error.retryable === true;
             const hasRetriesLeft = retryNumber < MAX_RETRIES_PER_MODEL;
             if (!isRetryable || !hasRetriesLeft) {
                 throw error;
@@ -238,36 +288,34 @@ async function generateWithModel(model, prompt, userId, analysisId, promptType =
 /**
  * Generates JSON-only content from Gemini.
  *
- * Strategy:
+ * Model strategy:
+ * 1. Configured GEMINI_MODEL
+ * 2. Fallback models only when switching may help
  *
- * Model 1
- *   -> retry with exponential backoff + jitter
- *   -> retry again
+ * 429:
+ * - stop immediately
+ * - do not retry
+ * - do not switch models
  *
- * Model 2
- *   -> retry with exponential backoff + jitter
- *   -> retry again
- *
- * Model 3
- *   -> retry with exponential backoff + jitter
- *   -> retry again
- *
- * This is especially important for temporary 503 UNAVAILABLE
- * responses caused by Gemini service capacity/high demand.
+ * Transient errors:
+ * - retry the same model
+ * - then try the next model
  */
 async function generateJson(prompt, options = {}) {
     const { userId, analysisId, promptType = 'career-report', } = options;
+    const modelPreference = getModelPreference();
     logger_1.logger.info('[GEMINI] Starting generation', {
-        model: MODEL_PREFERENCE[0],
-        fallbackModel: MODEL_PREFERENCE[1],
+        model: modelPreference[0],
+        fallbackModel: modelPreference[1],
+        configuredModels: modelPreference,
         promptLength: prompt.length,
         userId,
         analysisId,
         promptType,
     });
     const errors = [];
-    for (let modelIndex = 0; modelIndex < MODEL_PREFERENCE.length; modelIndex += 1) {
-        const model = MODEL_PREFERENCE[modelIndex];
+    for (let modelIndex = 0; modelIndex < modelPreference.length; modelIndex += 1) {
+        const model = modelPreference[modelIndex];
         try {
             const result = await generateWithModel(model, prompt, userId, analysisId, promptType);
             logger_1.logger.info('[GEMINI] Generation successful', {
@@ -290,15 +338,34 @@ async function generateJson(prompt, options = {}) {
                 status: error.status,
                 message: error.message,
             });
-            const nextModel = MODEL_PREFERENCE[modelIndex + 1];
-            if (!nextModel) {
-                break;
+            /*
+             * CRITICAL:
+             *
+             * A 429 is a project-level quota/rate-limit problem.
+             * Trying another model will not solve the quota issue.
+             */
+            if (error.errorKind === 'rate_limit') {
+                logger_1.logger.warn('[GEMINI] Project quota/rate limit reached — no fallback model attempted', {
+                    failedModel: model,
+                    errorStatus: error.status,
+                    errorCode: error.errorCode,
+                    userId,
+                    analysisId,
+                    promptType,
+                });
+                throw new ApiError_1.ApiError(429, 'Gemini API free-tier quota or rate limit has been reached. No additional Gemini requests were attempted. Please try again after the quota window resets.', ApiError_1.ErrorCodes.AI_GENERATION_FAILED);
             }
-            // Authentication and invalid-request errors will not be fixed
-            // by changing models, so fail immediately.
+            /*
+             * Authentication and invalid-request errors will not be fixed
+             * by changing models.
+             */
             if (error.errorKind === 'auth' ||
                 error.errorKind === 'invalid_request') {
                 throw new ApiError_1.ApiError(error.status || 502, `Gemini API request failed: ${error.message}`, ApiError_1.ErrorCodes.AI_GENERATION_FAILED);
+            }
+            const nextModel = modelPreference[modelIndex + 1];
+            if (!nextModel) {
+                break;
             }
             logger_1.logger.warn('[GEMINI] Switching to fallback model', {
                 failedModel: model,
@@ -325,9 +392,6 @@ async function generateJson(prompt, options = {}) {
         analysisId,
         promptType,
     });
-    if (lastError?.errorKind === 'rate_limit') {
-        throw new ApiError_1.ApiError(429, 'Gemini API rate limit reached. Please try again shortly.', ApiError_1.ErrorCodes.AI_GENERATION_FAILED);
-    }
     if (lastError?.errorKind === 'transient') {
         throw new ApiError_1.ApiError(503, 'Gemini is temporarily unavailable due to high demand. Please try again shortly.', ApiError_1.ErrorCodes.AI_GENERATION_FAILED);
     }
@@ -337,8 +401,8 @@ async function generateJson(prompt, options = {}) {
 /**
  * Lightweight connectivity check.
  *
- * This does not expose the API key and can be used by a diagnostic
- * route to verify that the Gemini API is reachable.
+ * This only verifies whether the API key is configured.
+ * It does not make a Gemini generation request.
  */
 async function validateGeminiConnectivity() {
     const apiKey = env_1.env.GEMINI_API_KEY?.trim();

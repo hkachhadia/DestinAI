@@ -50,27 +50,91 @@ const router = (0, express_1.Router)();
 router.use(auth_middleware_1.authMiddleware);
 /**
  * GET /ai/insights/career-report/latest
+ *
  * Returns the stored AI insight for the most recent analysis.
- * Searches by analysisId so a refreshed insight is always found correctly.
+ *
+ * If the deterministic analysis has completed but Gemini has not
+ * finished yet, insight will be null and aiStatus will be pending_refresh.
  */
 router.get('/insights/career-report/latest', (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const analysis = await (0, analysis_service_1.getLatestAnalysis)(req.user.id);
     if (!analysis) {
         throw new ApiError_1.ApiError(404, 'No analysis found. Run a career scan first.', ApiError_1.ErrorCodes.ANALYSIS_NOT_FOUND);
     }
-    // FIX BUG 4: Search by (userId, analysisId) not by aiInsightId reference.
-    // This ensures we always find the insight even if aiInsightId was not updated.
+    // Search by userId + analysisId instead of aiInsightId.
+    // This guarantees the correct insight is found for this analysis.
     const insight = await (0, ai_service_1.getInsightByAnalysisId)(req.user.id, String(analysis._id));
     logger_1.logger.info('[AI_ROUTE] Fetched latest insight', {
         userId: req.user.id,
         analysisId: String(analysis._id),
         hasInsight: !!insight,
     });
-    // Include a human-readable status so the frontend can show the right message
-    const aiStatus = insight
-        ? 'ready'
-        : 'pending_refresh'; // click "Refresh AI Insights" to generate
-    return res.json((0, ApiResponse_1.ok)(req, { analysis, insight, aiStatus }));
+    const aiStatus = insight ? 'ready' : 'pending_refresh';
+    return res.json((0, ApiResponse_1.ok)(req, {
+        analysis,
+        insight,
+        aiStatus,
+    }));
+}));
+/**
+ * POST /ai/insights/generate/:analysisId
+ *
+ * Generates the AI report for one exact analysis.
+ *
+ * IMPORTANT:
+ * This endpoint is intentionally separate from POST /analysis.
+ * The deterministic analysis can therefore return immediately without
+ * waiting for Gemini.
+ */
+router.post('/insights/generate/:analysisId', (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const { analysisId } = req.params;
+    logger_1.logger.info('[AI_ROUTE] Starting AI report generation', {
+        userId: req.user.id,
+        analysisId,
+    });
+    // Verify that this analysis belongs to the authenticated user.
+    const analysis = await (0, analysis_service_1.getAnalysisById)(req.user.id, analysisId);
+    if (!analysis) {
+        throw new ApiError_1.ApiError(404, 'Analysis not found.', ApiError_1.ErrorCodes.ANALYSIS_NOT_FOUND);
+    }
+    // Fetch the latest real data used for the AI report.
+    const [resume, github, competitiveProfiles] = await Promise.all([
+        (0, resume_service_1.getLatestResume)(req.user.id),
+        (0, github_service_1.getGitHubProfile)(req.user.id),
+        (0, cp_service_1.getAllProfiles)(req.user.id),
+    ]);
+    try {
+        const insight = await (0, ai_service_1.generateCareerReport)(req.user.id, String(analysis._id), {
+            targetRole: analysis.targetRole,
+            resume,
+            github,
+            competitiveProfiles,
+            scores: analysis.scores,
+            missingSkillsFromEngine: analysis.skillMatch?.missingSkills ?? [],
+        });
+        // Keep the analysis -> insight reference synchronized.
+        await analysis_model_1.Analysis.findByIdAndUpdate(analysis._id, {
+            aiInsightId: new mongoose_1.Types.ObjectId(String(insight._id)),
+        });
+        logger_1.logger.info('[AI_ROUTE] AI report generation completed', {
+            userId: req.user.id,
+            analysisId: String(analysis._id),
+            insightId: String(insight._id),
+        });
+        return res.status(201).json((0, ApiResponse_1.ok)(req, {
+            analysis,
+            insight,
+            aiStatus: 'ready',
+        }));
+    }
+    catch (err) {
+        logger_1.logger.error('[AI_ROUTE] AI report generation failed', {
+            userId: req.user.id,
+            analysisId: String(analysis._id),
+            error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+    }
 }));
 /**
  * GET /ai/insights/career-report/:analysisId
@@ -78,13 +142,18 @@ router.get('/insights/career-report/latest', (0, asyncHandler_1.asyncHandler)(as
 router.get('/insights/career-report/:analysisId', (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const analysis = await (0, analysis_service_1.getAnalysisById)(req.user.id, req.params.analysisId);
     const insight = await (0, ai_service_1.getInsightByAnalysisId)(req.user.id, String(analysis._id));
-    return res.json((0, ApiResponse_1.ok)(req, { analysis, insight }));
+    return res.json((0, ApiResponse_1.ok)(req, {
+        analysis,
+        insight,
+    }));
 }));
 /**
  * POST /ai/insights/refresh
- * FIX BUG 4: After refreshing the insight, update Analysis.aiInsightId to
- * point to the new insight document. Without this, GET /latest always returned
- * insight: null because aiInsightId referenced the deleted document.
+ *
+ * Regenerates the AI insight for the latest analysis.
+ *
+ * This remains available for the existing "Refresh AI Insights"
+ * functionality.
  */
 router.post('/insights/refresh', (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const analysis = await (0, analysis_service_1.getLatestAnalysis)(req.user.id);
@@ -95,7 +164,7 @@ router.post('/insights/refresh', (0, asyncHandler_1.asyncHandler)(async (req, re
         userId: req.user.id,
         analysisId: String(analysis._id),
     });
-    // Fetch the latest real profile data for Gemini context
+    // Fetch the latest real profile data for Gemini context.
     const [resume, github, competitiveProfiles] = await Promise.all([
         (0, resume_service_1.getLatestResume)(req.user.id),
         (0, github_service_1.getGitHubProfile)(req.user.id),
@@ -109,14 +178,19 @@ router.post('/insights/refresh', (0, asyncHandler_1.asyncHandler)(async (req, re
         scores: analysis.scores,
         missingSkillsFromEngine: analysis.skillMatch?.missingSkills ?? [],
     });
-    // FIX BUG 4: Update aiInsightId on the Analysis document to point to new insight
-    await analysis_model_1.Analysis.findByIdAndUpdate(analysis._id, { aiInsightId: new mongoose_1.Types.ObjectId(String(insight._id)) });
+    // Update the Analysis document to point to the new insight.
+    await analysis_model_1.Analysis.findByIdAndUpdate(analysis._id, {
+        aiInsightId: new mongoose_1.Types.ObjectId(String(insight._id)),
+    });
     logger_1.logger.info('[AI_ROUTE] Insight refresh complete, aiInsightId updated', {
         userId: req.user.id,
         analysisId: String(analysis._id),
         newInsightId: String(insight._id),
     });
-    return res.status(201).json((0, ApiResponse_1.ok)(req, { analysis, insight }));
+    return res.status(201).json((0, ApiResponse_1.ok)(req, {
+        analysis,
+        insight,
+    }));
 }));
 /**
  * GET /ai/insights/interview-prep
@@ -126,9 +200,9 @@ router.get('/insights/interview-prep', (0, asyncHandler_1.asyncHandler)(async (r
     if (!analysis) {
         throw new ApiError_1.ApiError(404, 'No AI insight found. Run a career analysis first.', ApiError_1.ErrorCodes.ANALYSIS_NOT_FOUND);
     }
-    // FIX BUG 4: Always look up by (userId, analysisId), not aiInsightId
     const insight = await (0, ai_service_1.getInsightByAnalysisId)(req.user.id, String(analysis._id));
-    if (!insight || insight.report.interviewQuestions.length === 0) {
+    if (!insight ||
+        insight.report.interviewQuestions.length === 0) {
         throw new ApiError_1.ApiError(404, 'No interview questions yet. Click "Refresh AI Insights" to generate them.', ApiError_1.ErrorCodes.ANALYSIS_NOT_FOUND);
     }
     return res.json((0, ApiResponse_1.ok)(req, {
@@ -138,12 +212,11 @@ router.get('/insights/interview-prep', (0, asyncHandler_1.asyncHandler)(async (r
         interviewReadiness: insight.report.interviewReadiness,
     }));
 }));
-exports.default = router;
 /**
  * GET /ai/diagnostic
+ *
  * Backend-only Gemini connectivity test.
  * Protected by auth — never exposes the API key.
- * Returns { ok: true, model } on success or { ok: false, error } on failure.
  */
 router.get('/diagnostic', (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const { env } = await Promise.resolve().then(() => __importStar(require('../../config/env')));
@@ -158,7 +231,10 @@ router.get('/diagnostic', (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const model = env.GEMINI_MODEL ?? 'gemini-3.8-flash';
     const start = Date.now();
     try {
-        const result = await generateJson('Return exactly this JSON and nothing else: {"status":"ok"}', { userId: req.user.id, promptType: 'diagnostic' });
+        const result = await generateJson('Return exactly this JSON and nothing else: {"status":"ok"}', {
+            userId: req.user.id,
+            promptType: 'diagnostic',
+        });
         return res.json({
             ok: true,
             model,
@@ -171,10 +247,12 @@ router.get('/diagnostic', (0, asyncHandler_1.asyncHandler)(async (req, res) => {
             ok: false,
             model,
             error: err.message,
-            hint: err.message.includes('403') || err.message.includes('401')
+            hint: err.message.includes('403') ||
+                err.message.includes('401')
                 ? 'Gemini authentication failed. Create/verify an authorization API key in Google AI Studio and store it as GEMINI_API_KEY on the backend.'
                 : 'Check server logs for details',
         });
     }
 }));
+exports.default = router;
 //# sourceMappingURL=ai.routes.js.map
