@@ -17,6 +17,7 @@ const githubClient = createRetryingClient({
   baseURL: 'https://api.github.com',
   headers: {
     Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
     ...(env.GITHUB_API_TOKEN
       ? {
           Authorization: `Bearer ${env.GITHUB_API_TOKEN}`,
@@ -24,6 +25,23 @@ const githubClient = createRetryingClient({
       : {}),
   },
 });
+
+// Public REST fallback. GitHub's public user/repository endpoints can be
+// accessed without authentication. This is intentionally kept separate from
+// the authenticated client so an invalid/revoked server token does not make
+// all public GitHub scoring fail.
+const githubPublicClient = createRetryingClient({
+  baseURL: 'https://api.github.com',
+  headers: {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  },
+});
+
+function isGitHubUnauthorized(err: unknown): boolean {
+  const error = err as GitHubErrorResponse;
+  return error.response?.status === 401;
+}
 
 interface GitHubUserResponse {
   login: string;
@@ -67,8 +85,25 @@ async function fetchGitHubUser(
 
     return data;
   } catch (err) {
+    // A bad/revoked GITHUB_API_TOKEN should not prevent public GitHub
+    // profiles from being analyzed. Retry the public endpoint once without
+    // authentication. Other errors are still surfaced normally.
+    if (isGitHubUnauthorized(err)) {
+      logger.warn('[GITHUB] Authenticated request returned 401; retrying public user endpoint', {
+        username,
+      });
+
+      try {
+        const { data } = await githubPublicClient.get<GitHubUserResponse>(
+          `/users/${encodeURIComponent(username)}`,
+        );
+        return data;
+      } catch (publicErr) {
+        handleGithubError(publicErr);
+      }
+    }
+
     handleGithubError(err);
-    throw err;
   }
 }
 
@@ -78,21 +113,40 @@ async function fetchGitHubUser(
 async function fetchGitHubRepos(
   username: string,
 ): Promise<GitHubRepoResponse[]> {
+  const requestConfig = {
+    params: {
+      per_page: 100,
+      sort: 'updated',
+    },
+  };
+
   try {
     const { data } = await githubClient.get<GitHubRepoResponse[]>(
       `/users/${encodeURIComponent(username)}/repos`,
-      {
-        params: {
-          per_page: 100,
-          sort: 'updated',
-        },
-      },
+      requestConfig,
     );
 
     return data;
   } catch (err) {
+    // See fetchGitHubUser(): a stale server token must not turn public
+    // repository data into a zero GitHub score.
+    if (isGitHubUnauthorized(err)) {
+      logger.warn('[GITHUB] Authenticated repository request returned 401; retrying public repository endpoint', {
+        username,
+      });
+
+      try {
+        const { data } = await githubPublicClient.get<GitHubRepoResponse[]>(
+          `/users/${encodeURIComponent(username)}/repos`,
+          requestConfig,
+        );
+        return data;
+      } catch (publicErr) {
+        handleGithubError(publicErr);
+      }
+    }
+
     handleGithubError(err);
-    throw err;
   }
 }
 
@@ -152,7 +206,7 @@ async function fetchCommitsLastYear(
     );
 
     if (data.errors?.length) {
-      logger.warn('[GITHUB] GraphQL returned errors', {
+      logger.warn('[GITHUB] GraphQL returned errors; commits will be recorded as 0', {
         username,
         errors: data.errors,
       });
@@ -160,10 +214,18 @@ async function fetchCommitsLastYear(
       return 0;
     }
 
-    return (
+    const totalContributions =
       data.data?.user?.contributionsCollection?.contributionCalendar
-        ?.totalContributions ?? 0
-    );
+        ?.totalContributions;
+
+    if (typeof totalContributions !== 'number') {
+      logger.warn('[GITHUB] GraphQL returned no contribution count; commits will be recorded as 0', {
+        username,
+      });
+      return 0;
+    }
+
+    return totalContributions;
   } catch (err) {
     const error = err as GitHubErrorResponse;
 
@@ -417,6 +479,7 @@ export async function syncGitHubProfile(
   logger.info('[GITHUB] Starting profile sync', {
     userId,
     username,
+    authenticatedClientConfigured: Boolean(env.GITHUB_API_TOKEN),
   });
 
   /*
